@@ -4,7 +4,36 @@ const cron = require("node-cron");
 const { scrapeProduct } = require("./scraper");
 
 const app = express();
-app.use(cors());
+
+/**
+ * CORS: permite tu frontend (Vercel) + localhost.
+ * Ajusta/añade dominios si cambias de preview o usas dominio propio.
+ */
+const ALLOWED_ORIGINS = [
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "https://chilepricetrack.com",
+  "https://www.chilepricetrack.com",
+
+  // Vercel preview / deploy (agrega el tuyo actual si cambia)
+  "https://precio-chile-track-o96rljfqy-martin-gonzalezs-projects-ff1669a3.vercel.app",
+];
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Permite requests sin Origin (Postman, cron, server-to-server)
+      if (!origin) return cb(null, true);
+
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+
+      return cb(new Error(`CORS bloqueado para origin: ${origin}`));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+  })
+);
+
 app.use(express.json());
 
 let productos = [];

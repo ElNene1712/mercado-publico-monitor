@@ -6,38 +6,47 @@ const { scrapeProduct } = require("./scraper");
 const app = express();
 
 /**
- * CORS:
- * - Permite localhost (dev)
- * - Permite dominio propio (prod)
- * - Permite cualquier deploy/preview de Vercel (*.vercel.app)
+ * CORS (Vercel + dominio propio + localhost)
+ * Tu problema ahora es que el ORIGIN que llega es un preview DISTINTO:
+ *   https://precio-chile-track-5g58veadx-martin-gonzalezs-projects-ff1669a3.vercel.app
+ * y no está en la lista, entonces queda bloqueado.
  *
- * Así no tienes que estar agregando el preview nuevo cada vez.
+ * Solución: permitir wildcard seguro para *.vercel.app + tus dominios.
  */
-const ALLOWED_ORIGINS = [
+const ALLOWED_ORIGINS = new Set([
   "http://localhost:5173",
   "http://localhost:3000",
   "https://chilepricetrack.com",
   "https://www.chilepricetrack.com",
+]);
+
+const ALLOWED_ORIGIN_REGEX = [
+  // cualquier preview de vercel para tu proyecto
+  /^https:\/\/precio-chile-track-[a-z0-9-]+-martin-gonzalezs-projects-ff1669a3\.vercel\.app$/i,
+
+  // si algún día cambia el subdominio del proyecto, esto lo cubre igual:
+  /^https:\/\/[a-z0-9-]+\.vercel\.app$/i,
 ];
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      // Permite requests sin Origin (Postman, cron, server-to-server)
-      if (!origin) return cb(null, true);
+function isOriginAllowed(origin) {
+  if (!origin) return true; // server-to-server, cron, postman
+  if (ALLOWED_ORIGINS.has(origin)) return true;
+  return ALLOWED_ORIGIN_REGEX.some((re) => re.test(origin));
+}
 
-      // Permite lista fija
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (isOriginAllowed(origin)) return cb(null, true);
+    return cb(null, false); // NO tires error (si tiras error, queda sin headers y se ve "No Access-Control-Allow-Origin")
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"],
+  maxAge: 86400,
+};
 
-      // Permite cualquier preview/deploy de Vercel
-      if (origin.endsWith(".vercel.app")) return cb(null, true);
-
-      return cb(new Error(`CORS bloqueado para origin: ${origin}`));
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
-  })
-);
+app.use(cors(corsOptions));
+// Preflight para cualquier ruta
+app.options("*", cors(corsOptions));
 
 app.use(express.json());
 
@@ -100,7 +109,6 @@ cron.schedule("0 */3 * * *", async () => {
 
 /* Railway: usar el puerto que te entrega la plataforma */
 const PORT = process.env.PORT || 3000;
-
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Servidor en puerto", PORT);
 });

@@ -106,7 +106,7 @@ cron.schedule("0 */3 * * *", async () => {
 });
 
 /* Railway: usar el puerto que entrega la plataforma */
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Servidor en puerto", PORT);

@@ -6,47 +6,45 @@ const { scrapeProduct } = require("./scraper");
 const app = express();
 
 /**
- * CORS (Vercel + dominio propio + localhost)
- * Tu problema ahora es que el ORIGIN que llega es un preview DISTINTO:
- *   https://precio-chile-track-5g58veadx-martin-gonzalezs-projects-ff1669a3.vercel.app
- * y no está en la lista, entonces queda bloqueado.
+ * CORS:
+ * - Permite dominio prod (chilepricetrack.com)
+ * - Permite localhost
+ * - Permite cualquier preview de Vercel de precio-chile-track-*
  *
- * Solución: permitir wildcard seguro para *.vercel.app + tus dominios.
+ * OJO: Si tu proyecto Vercel cambia el prefijo, ajusta el regex.
  */
-const ALLOWED_ORIGINS = new Set([
+const allowlist = new Set([
   "http://localhost:5173",
   "http://localhost:3000",
   "https://chilepricetrack.com",
   "https://www.chilepricetrack.com",
 ]);
 
-const ALLOWED_ORIGIN_REGEX = [
-  // cualquier preview de vercel para tu proyecto
-  /^https:\/\/precio-chile-track-[a-z0-9-]+-martin-gonzalezs-projects-ff1669a3\.vercel\.app$/i,
+const vercelPreviewRegex =
+  /^https:\/\/precio-chile-track-[a-z0-9-]+\.vercel\.app$/i;
 
-  // si algún día cambia el subdominio del proyecto, esto lo cubre igual:
-  /^https:\/\/[a-z0-9-]+\.vercel\.app$/i,
-];
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      // Permite requests sin Origin (cron, curl, server-to-server)
+      if (!origin) return cb(null, true);
 
-function isOriginAllowed(origin) {
-  if (!origin) return true; // server-to-server, cron, postman
-  if (ALLOWED_ORIGINS.has(origin)) return true;
-  return ALLOWED_ORIGIN_REGEX.some((re) => re.test(origin));
-}
+      if (allowlist.has(origin)) return cb(null, true);
+      if (vercelPreviewRegex.test(origin)) return cb(null, true);
 
-const corsOptions = {
-  origin: (origin, cb) => {
-    if (isOriginAllowed(origin)) return cb(null, true);
-    return cb(null, false); // NO tires error (si tiras error, queda sin headers y se ve "No Access-Control-Allow-Origin")
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type"],
-  maxAge: 86400,
-};
+      // En vez de lanzar error (que a veces tumba preflight),
+      // devolvemos false y listo.
+      return cb(null, false);
+    },
+    credentials: false,
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    optionsSuccessStatus: 204,
+  })
+);
 
-app.use(cors(corsOptions));
-// Preflight para cualquier ruta
-app.options("*", cors(corsOptions));
+// Importante para preflight
+app.options("*", cors());
 
 app.use(express.json());
 
@@ -107,8 +105,9 @@ cron.schedule("0 */3 * * *", async () => {
   }
 });
 
-/* Railway: usar el puerto que te entrega la plataforma */
+/* Railway: usar el puerto que entrega la plataforma */
 const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Servidor en puerto", PORT);
 });

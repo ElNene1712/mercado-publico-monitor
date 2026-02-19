@@ -292,3 +292,16 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Servidor en puerto", PORT);
 });
+const { shutdownScraper } = require("./scraper");
+
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM recibido, cerrando scraper...");
+  await shutdownScraper();
+  process.exit(0);
+});
+
+process.on("SIGINT", async () => {
+  console.log("SIGINT recibido, cerrando scraper...");
+  await shutdownScraper();
+  process.exit(0);
+});

@@ -137,15 +137,24 @@ async function hasNoResults(page) {
 
 /* =========================================================
    ✅ Espera a que haya precios reales
+   (con fallback para "sin resultados" y estados raros)
 ========================================================= */
 async function waitOffersLoaded(page, timeoutMs = 25000) {
   return await safeWait(
     (opts) =>
       page.waitForFunction(() => {
+        const bodyText = document.body?.innerText || "";
+        if (/No se encontraron|Sin resultados|No hay resultados/i.test(bodyText)) {
+          // señal de "no hay proveedores" => no esperar infinitamente
+          return true;
+        }
+
         const els = Array.from(
           document.querySelectorAll("td.wk-ap-price[data-base]")
         );
         if (!els.length) return false;
+
+        // Si hay precios > 0, ok
         return els.some((el) => {
           const v = Number(el.getAttribute("data-base") || "0");
           return Number.isFinite(v) && v > 0;
@@ -241,7 +250,6 @@ async function ensureProvidersSectionVisible(page) {
 
 /* =========================================================
    ✅ NUEVO: espera robusta del selector de regiones
-   - a veces no aparece de inmediato aunque el h1 sí
 ========================================================= */
 async function waitForRegionSelect(page) {
   const regionSelect = page.locator("select#attribute2276").first();
@@ -291,7 +299,9 @@ async function waitForRegionSelect(page) {
 }
 
 /* =========================================================
-   ✅ scrapeProduct: usa context singleton, crea page, cierra page
+   ✅ scrapeProduct: FIX para RM+VALPO (reload por región)
+   - VALPO y OHIGGINS solos funcionan, pero combinado se ensucia el DOM.
+   - Solución: recargar la página del producto entre regiones (estable).
 ========================================================= */
 async function scrapeProduct(query, regionesElegidas = ["RM"]) {
   await acquire();
@@ -322,17 +332,44 @@ async function scrapeProduct(query, regionesElegidas = ["RM"]) {
           regiones: {},
         };
 
-        // ✅ robusto
-        const regionSelect = await waitForRegionSelect(page);
+        // ✅ guarda URL del producto para reloads limpios
+        const productUrl = page.url();
 
+        // ✅ por cada región: recarga la página del producto (evita “estado sucio”)
         for (const regionKey of regionesElegidas) {
           const regionId = REGIONES[regionKey];
           if (!regionId) continue;
 
+          // 🔥 clave: reset estado antes de cambiar región
+          try {
+            await page.goto(productUrl, { waitUntil: "domcontentloaded" });
+          } catch (_) {
+            // fallback a reload si goto falla
+            try {
+              await page.reload({ waitUntil: "domcontentloaded" });
+            } catch (_) {}
+          }
+
+          // ✅ re-obtén select (nuevos locators tras reload/goto)
+          const regionSelect = await waitForRegionSelect(page);
+
           await regionSelect.selectOption(regionId);
+
+          // confirma que el select quedó con ese value (mejora estabilidad)
+          await page
+            .waitForFunction(
+              (val) => {
+                const sel = document.querySelector("select#attribute2276");
+                return sel && sel.value === val;
+              },
+              regionId,
+              { timeout: 8000 }
+            )
+            .catch(() => {});
+
           await ensureProvidersSectionVisible(page);
 
-          const offersOk = await waitOffersLoaded(page, 25000);
+          const offersOk = await waitOffersLoaded(page, 20000);
           if (!offersOk) {
             result.regiones[regionKey] = null;
             continue;
@@ -395,7 +432,9 @@ async function scrapeProduct(query, regionesElegidas = ["RM"]) {
           console.warn(`[scraper] Attempt ${attempt} failed, retrying...`, msg);
           await resetBrowser();
           // cerrar page si existe
-          try { if (page) await page.close().catch(() => {}); } catch (_) {}
+          try {
+            if (page) await page.close().catch(() => {});
+          } catch (_) {}
           page = null;
           await sleep(800);
           continue;
@@ -403,8 +442,6 @@ async function scrapeProduct(query, regionesElegidas = ["RM"]) {
 
         // otros errores: no reintentar
         throw e;
-      } finally {
-        // si vamos a reintentar, la page se cierra arriba
       }
     }
   } finally {

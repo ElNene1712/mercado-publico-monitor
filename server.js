@@ -1,7 +1,10 @@
+// server.js
 const express = require("express");
 const cors = require("cors");
 const cron = require("node-cron");
-const { scrapeProduct } = require("./scraper");
+
+// ✅ Trae ambos desde una sola vez (evita doble require)
+const { scrapeProduct, shutdownScraper } = require("./scraper");
 
 // ✅ Supabase (solo backend)
 const { createClient } = require("@supabase/supabase-js");
@@ -137,11 +140,8 @@ async function runBatchSync() {
   try {
     console.log(`[batch] Iniciando batch: ${BATCH_SIZE} productos`);
 
-    // ✅ Intento 1: si existe last_sync, ordenamos por last_sync ASC (null primero)
-    // Si no existe, fallback a created_at ASC
     let products = null;
 
-    // Probamos query con last_sync (si la columna no existe, Supabase devuelve error)
     {
       const { data, error } = await supabase
         .from("tracked_products")
@@ -152,7 +152,10 @@ async function runBatchSync() {
       if (!error) {
         products = data || [];
       } else {
-        console.warn("[batch] No pude ordenar por last_sync (quizás no existe aún). Fallback a created_at.", error.message);
+        console.warn(
+          "[batch] No pude ordenar por last_sync (quizás no existe aún). Fallback a created_at.",
+          error.message
+        );
 
         const { data: data2, error: error2 } = await supabase
           .from("tracked_products")
@@ -171,29 +174,36 @@ async function runBatchSync() {
     }
 
     for (const p of products) {
-      const regiones = Array.isArray(p.regions) && p.regions.length ? p.regions : ["RM"];
+      const regiones =
+        Array.isArray(p.regions) && p.regions.length ? p.regions : ["RM"];
 
-      // regiones guardadas como full names o keys? -> convertimos a keys si viene full name
-      // (mínimo defensivo; lo ideal es guardar keys en DB, pero no rompo tu sistema)
       const normalizeRegionKey = (r) => {
         if (!r) return null;
         const s = String(r).trim();
         if (s === "RM" || s === "VALPO" || s === "OHIGGINS") return s;
         if (s.includes("Metropolitana")) return "RM";
         if (s.includes("Valpara")) return "VALPO";
-        if (s.includes("O'Higgins") || s.includes("OHiggins") || s.includes("Bernardo O'Higgins")) return "OHIGGINS";
+        if (
+          s.includes("O'Higgins") ||
+          s.includes("OHiggins") ||
+          s.includes("Bernardo O'Higgins")
+        )
+          return "OHIGGINS";
         return null;
       };
 
       const regionKeys = regiones.map(normalizeRegionKey).filter(Boolean);
-      const uniqueRegionKeys = Array.from(new Set(regionKeys.length ? regionKeys : ["RM"]));
+      const uniqueRegionKeys = Array.from(
+        new Set(regionKeys.length ? regionKeys : ["RM"])
+      );
 
       try {
-        console.log(`[batch] Sync ${p.product_id} (${uniqueRegionKeys.join(",")})`);
+        console.log(
+          `[batch] Sync ${p.product_id} (${uniqueRegionKeys.join(",")})`
+        );
 
         const data = await scrapeProduct(p.product_id, uniqueRegionKeys);
 
-        // Armamos snapshot SOLO con columnas existentes hoy
         const snapshot = {
           tracked_product_id: p.id,
           title: data?.nombre || null,
@@ -209,24 +219,25 @@ async function runBatchSync() {
           snapshot[col] = Number.isFinite(Number(precio)) ? Number(precio) : null;
         }
 
-        const { error: insErr } = await supabase.from("product_snapshots").insert(snapshot);
+        const { error: insErr } = await supabase
+          .from("product_snapshots")
+          .insert(snapshot);
         if (insErr) throw insErr;
 
-        // ✅ Intentamos actualizar last_sync (si no existe aún, NO rompemos)
         const { error: upErr } = await supabase
           .from("tracked_products")
           .update({ last_sync: new Date().toISOString() })
           .eq("id", p.id);
 
         if (upErr) {
-          // lo dejamos en warning para que no pare el batch
-          console.warn("[batch] No pude actualizar last_sync (ok por ahora):", upErr.message);
+          console.warn(
+            "[batch] No pude actualizar last_sync (ok por ahora):",
+            upErr.message
+          );
         }
-
       } catch (e) {
         console.error("[batch] Error syncing", p.product_id, e?.message || e);
 
-        // guardamos snapshot de error (con columnas existentes)
         try {
           await supabase.from("product_snapshots").insert({
             tracked_product_id: p.id,
@@ -239,11 +250,13 @@ async function runBatchSync() {
             fetched_at: new Date().toISOString(),
           });
         } catch (e2) {
-          console.error("[batch] Error guardando snapshot de error:", e2?.message || e2);
+          console.error(
+            "[batch] Error guardando snapshot de error:",
+            e2?.message || e2
+          );
         }
       }
 
-      // pausa suave para no saturar MP / tu server
       await new Promise((res) => setTimeout(res, BATCH_DELAY_MS));
     }
 
@@ -270,38 +283,38 @@ app.post("/batch-sync", async (req, res) => {
   }
 });
 
-/* ----------------------------------------
-   (Tu cron antiguo cada 3h sobre memoria)
-   Lo dejo comentado para que no tengas 2 crons peleando.
------------------------------------------ */
-// cron.schedule("0 */3 * * *", async () => {
-//   console.log("Actualizando productos (memoria)...");
-//   for (let p of productos) {
-//     try {
-//       const data = await scrapeProduct(p.id, p.regiones);
-//       p.ultimo = data;
-//     } catch (e) {
-//       console.log("Error actualizando", p.id, e?.message || e);
-//     }
-//   }
-// });
-
 /* Railway: usar el puerto que entrega la plataforma */
 const PORT = process.env.PORT || 8080;
 
+/* -------------------------------
+   ✅ Shutdown handlers (seguro)
+-------------------------------- */
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} recibido, cerrando scraper...`);
+  try {
+    await shutdownScraper();
+  } catch (e) {
+    console.error("Error cerrando scraper:", e?.message || e);
+  } finally {
+    process.exit(0);
+  }
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+process.on("unhandledRejection", (reason) => {
+  console.error("unhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("uncaughtException:", err);
+  // opcional: cerrar para evitar proceso zombie
+  gracefulShutdown("uncaughtException");
+});
+
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Servidor en puerto", PORT);
-});
-const { shutdownScraper } = require("./scraper");
-
-process.on("SIGTERM", async () => {
-  console.log("SIGTERM recibido, cerrando scraper...");
-  await shutdownScraper();
-  process.exit(0);
-});
-
-process.on("SIGINT", async () => {
-  console.log("SIGINT recibido, cerrando scraper...");
-  await shutdownScraper();
-  process.exit(0);
 });

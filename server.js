@@ -1,13 +1,8 @@
-// server.js
 const express = require("express");
 const cors = require("cors");
 const cron = require("node-cron");
-
-// ✅ Trae ambos desde una sola vez (evita doble require)
-const { scrapeProduct, shutdownScraper } = require("./scraper");
-
-// ✅ Supabase (solo backend)
 const { createClient } = require("@supabase/supabase-js");
+const { scrapeProduct, shutdownScraper } = require("./scraper");
 
 const app = express();
 
@@ -68,7 +63,7 @@ app.get("/health", (req, res) => {
   res.status(200).send("OK");
 });
 
-/* Endpoint manual (igual que antes) */
+/* Endpoint manual */
 app.get("/search", async (req, res) => {
   const id = req.query.id;
   const regiones = req.query.regiones ? req.query.regiones.split(",") : ["RM"];
@@ -79,8 +74,8 @@ app.get("/search", async (req, res) => {
     const data = await scrapeProduct(id, regiones);
     res.json(data);
   } catch (err) {
-    console.error("Error en /search:", err);
-    res.status(500).json({ error: "Error scraping" });
+    console.error("Error en /search:", err?.message || err);
+    res.status(500).json({ error: String(err?.message || err) });
   }
 });
 
@@ -105,14 +100,12 @@ app.get("/productos", (req, res) => {
 });
 
 /* ----------------------------------------
-   ✅ NUEVO: Batch sync real desde Supabase
-   - Cada 10 min, toma 20 productos y los actualiza
+   ✅ Batch sync real desde Supabase
 ----------------------------------------- */
+const BATCH_SIZE = Number(process.env.BATCH_SIZE || 10); // 👈 por defecto 10, más estable
+const BATCH_DELAY_MS = Number(process.env.BATCH_DELAY_MS || 2500); // 👈 más suave
+const PER_PRODUCT_TIMEOUT_MS = Number(process.env.PER_PRODUCT_TIMEOUT_MS || 120000); // 2 min por producto
 
-const BATCH_SIZE = Number(process.env.BATCH_SIZE || 20);
-const BATCH_DELAY_MS = Number(process.env.BATCH_DELAY_MS || 1500);
-
-// evita correr dos batches en paralelo
 let BATCH_RUNNING = false;
 
 function regionKeyToSnapshotColumn(regionKey) {
@@ -120,6 +113,34 @@ function regionKeyToSnapshotColumn(regionKey) {
   if (regionKey === "VALPO") return "valpo_price";
   if (regionKey === "OHIGGINS") return "ohiggins_price";
   return null;
+}
+
+function normalizeRegionKey(r) {
+  if (!r) return null;
+  const s = String(r).trim();
+  if (s === "RM" || s === "VALPO" || s === "OHIGGINS") return s;
+  if (s.toLowerCase().includes("metropolitana")) return "RM";
+  if (s.toLowerCase().includes("valpara")) return "VALPO";
+  if (
+    s.includes("O'Higgins") ||
+    s.includes("OHiggins") ||
+    s.includes("Bernardo O'Higgins") ||
+    s.toLowerCase().includes("higgins")
+  )
+    return "OHIGGINS";
+  return null;
+}
+
+async function withTimeout(promise, ms, label = "timeout") {
+  let t;
+  const timeout = new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(label)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 async function runBatchSync() {
@@ -140,6 +161,7 @@ async function runBatchSync() {
   try {
     console.log(`[batch] Iniciando batch: ${BATCH_SIZE} productos`);
 
+    // Intento ordenar por last_sync si existe, si no fallback a created_at
     let products = null;
 
     {
@@ -174,35 +196,25 @@ async function runBatchSync() {
     }
 
     for (const p of products) {
-      const regiones =
+      const regionesRaw =
         Array.isArray(p.regions) && p.regions.length ? p.regions : ["RM"];
 
-      const normalizeRegionKey = (r) => {
-        if (!r) return null;
-        const s = String(r).trim();
-        if (s === "RM" || s === "VALPO" || s === "OHIGGINS") return s;
-        if (s.includes("Metropolitana")) return "RM";
-        if (s.includes("Valpara")) return "VALPO";
-        if (
-          s.includes("O'Higgins") ||
-          s.includes("OHiggins") ||
-          s.includes("Bernardo O'Higgins")
-        )
-          return "OHIGGINS";
-        return null;
-      };
-
-      const regionKeys = regiones.map(normalizeRegionKey).filter(Boolean);
+      const regionKeys = regionesRaw.map(normalizeRegionKey).filter(Boolean);
       const uniqueRegionKeys = Array.from(
         new Set(regionKeys.length ? regionKeys : ["RM"])
       );
 
-      try {
-        console.log(
-          `[batch] Sync ${p.product_id} (${uniqueRegionKeys.join(",")})`
-        );
+      console.log(
+        `[batch] Sync ${p.product_id} (${uniqueRegionKeys.join(",")})`
+      );
 
-        const data = await scrapeProduct(p.product_id, uniqueRegionKeys);
+      try {
+        // ⏱️ timeout duro por producto para que nunca se “cuelgue” y dispare reinicios
+        const data = await withTimeout(
+          scrapeProduct(p.product_id, uniqueRegionKeys),
+          PER_PRODUCT_TIMEOUT_MS,
+          "per_product_timeout"
+        );
 
         const snapshot = {
           tracked_product_id: p.id,
@@ -224,6 +236,7 @@ async function runBatchSync() {
           .insert(snapshot);
         if (insErr) throw insErr;
 
+        // intenta actualizar last_sync (si no existe, ok)
         const { error: upErr } = await supabase
           .from("tracked_products")
           .update({ last_sync: new Date().toISOString() })
@@ -236,8 +249,13 @@ async function runBatchSync() {
           );
         }
       } catch (e) {
-        console.error("[batch] Error syncing", p.product_id, e?.message || e);
+        console.error(
+          "[batch] Error syncing",
+          p.product_id,
+          e?.message || e
+        );
 
+        // snapshot de error
         try {
           await supabase.from("product_snapshots").insert({
             tracked_product_id: p.id,
@@ -268,12 +286,15 @@ async function runBatchSync() {
   }
 }
 
-// ✅ Cron cada 10 minutos
+/**
+ * ✅ Cron cada 10 minutos
+ * Nota: Railway puede reiniciar el contenedor: el cron vuelve a partir.
+ */
 cron.schedule("*/10 * * * *", async () => {
   await runBatchSync();
 });
 
-// ✅ Endpoint manual para probar (opcional)
+/* ✅ Endpoint manual para probar */
 app.post("/batch-sync", async (req, res) => {
   try {
     await runBatchSync();
@@ -286,15 +307,14 @@ app.post("/batch-sync", async (req, res) => {
 /* Railway: usar el puerto que entrega la plataforma */
 const PORT = process.env.PORT || 8080;
 
-/* -------------------------------
-   ✅ Shutdown handlers (seguro)
--------------------------------- */
-let shuttingDown = false;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log("Servidor en puerto", PORT);
+});
+
+/* ✅ cierre limpio del scraper */
 async function gracefulShutdown(signal) {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  console.log(`${signal} recibido, cerrando scraper...`);
   try {
+    console.log(`${signal} recibido, cerrando scraper...`);
     await shutdownScraper();
   } catch (e) {
     console.error("Error cerrando scraper:", e?.message || e);
@@ -305,16 +325,3 @@ async function gracefulShutdown(signal) {
 
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
-
-process.on("unhandledRejection", (reason) => {
-  console.error("unhandledRejection:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("uncaughtException:", err);
-  // opcional: cerrar para evitar proceso zombie
-  gracefulShutdown("uncaughtException");
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("Servidor en puerto", PORT);
-});

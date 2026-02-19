@@ -1,29 +1,26 @@
-// scraper.js
 const { chromium } = require("playwright");
 
 const SEARCH_URL =
   "https://conveniomarco2.mercadopublico.cl/ferreteria2/productos-de-ferreteria";
 
-// OJO: estos valores deben coincidir con los <option value="..."> del select#attribute2276
+// OJO: estos valores deben coincidir con los <option value="..."> del select
 const REGIONES = {
   RM: "13",
   VALPO: "5",
   OHIGGINS: "6",
 };
 
-function parsePrecioBase(value) {
-  const n = Number(String(value || "").replace(/[^\d]/g, ""));
-  return Number.isFinite(n) ? n : 0;
-}
-
 function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
+function toNumberFromText(s) {
+  const n = Number(String(s || "").replace(/[^\d]/g, ""));
+  return Number.isFinite(n) ? n : 0;
+}
+
 /* =========================================================
    ✅ Semaphore simple: limita concurrencia de scrapes
-   - Por defecto: 1 (seguro para Railway + MP)
-   - Puedes setear env SCRAPER_CONCURRENCY=2 si quieres
 ========================================================= */
 const SCRAPER_CONCURRENCY = Number(process.env.SCRAPER_CONCURRENCY || 1);
 let active = 0;
@@ -51,7 +48,6 @@ let _browser = null;
 let _context = null;
 let _launching = null;
 
-// Si algo se rompe, reiniciamos el browser.
 async function resetBrowser() {
   try {
     if (_context) {
@@ -68,13 +64,10 @@ async function resetBrowser() {
 }
 
 async function getContext() {
-  // Evita doble launch simultáneo
   if (_launching) return _launching;
-
   if (_browser && _context) return _context;
 
   _launching = (async () => {
-    // Si existe browser pero no context, lo rearmamos
     if (!_browser) {
       _browser = await chromium.launch({
         headless: true,
@@ -85,7 +78,6 @@ async function getContext() {
         ],
       });
 
-      // Si Railway mata proceso, esto ayuda a detectar estado raro
       _browser.on("disconnected", async () => {
         console.warn("[scraper] Browser disconnected, resetting...");
         await resetBrowser();
@@ -100,10 +92,9 @@ async function getContext() {
       viewport: { width: 1280, height: 720 },
     });
 
-    // ✅ Importante: route SOLO una vez en el context (NO por page)
+    // bloquea assets pesados
     await _context.route("**/*", (route) => {
-      const req = route.request();
-      const type = req.resourceType();
+      const type = route.request().resourceType();
       if (type === "image" || type === "stylesheet" || type === "font") {
         return route.abort();
       }
@@ -125,7 +116,7 @@ async function getContext() {
 }
 
 /* =========================================================
-   ✅ Wait wrappers "no destructivos"
+   ✅ helpers de espera tolerantes
 ========================================================= */
 async function safeWait(fn, timeoutMs, onFailValue = false) {
   try {
@@ -134,28 +125,6 @@ async function safeWait(fn, timeoutMs, onFailValue = false) {
   } catch {
     return onFailValue;
   }
-}
-
-async function waitOffersLoaded(page, timeoutMs = 25000) {
-  return await safeWait(
-    (opts) =>
-      page.waitForFunction(() => {
-        // ✅ suficiente con que aparezca tabla de sellers O algún price>0
-        const sellerRows = document.querySelectorAll("tr.flag-row-seller");
-        if (sellerRows && sellerRows.length > 0) return true;
-
-        const els = Array.from(
-          document.querySelectorAll("td.wk-ap-price[data-base]")
-        );
-        if (!els.length) return false;
-        return els.some((el) => {
-          const v = Number(el.getAttribute("data-base") || "0");
-          return Number.isFinite(v) && v > 0;
-        });
-      }, opts),
-    timeoutMs,
-    false
-  );
 }
 
 async function hasNoResults(page) {
@@ -169,168 +138,28 @@ async function hasNoResults(page) {
   );
 }
 
-/* =========================================================
-   ✅ Helpers anti-banner / overlay (no rompe si no existe)
-========================================================= */
-async function dismissOverlays(page) {
-  // cookies / banners típicos
-  const candidates = [
-    'button:has-text("Aceptar")',
-    'button:has-text("ACEPTAR")',
-    'button:has-text("Entendido")',
-    'button:has-text("OK")',
-    'button:has-text("Cerrar")',
-    '[aria-label="close"]',
-    '[aria-label="Close"]',
-    'button[title="Close"]',
-  ];
+async function waitOffersLoaded(page, timeoutMs = 25000) {
+  // acepta precio por data-base o por texto
+  return await safeWait(
+    (opts) =>
+      page.waitForFunction(() => {
+        const tds = Array.from(document.querySelectorAll("td.wk-ap-price"));
+        if (!tds.length) return false;
 
-  for (const sel of candidates) {
-    const btn = page.locator(sel).first();
-    if ((await btn.count()) > 0) {
-      try {
-        await btn.click({ timeout: 800 });
-      } catch (_) {}
-    }
-  }
-}
-
-async function goToFirstProductFromSearch(page) {
-  await dismissOverlays(page);
-
-  const searchInput = page.locator("input#search, input[name='q']");
-  const okSearch = await safeWait(
-    (opts) => searchInput.waitFor({ state: "visible", ...opts }),
-    30000,
+        return tds.some((td) => {
+          const db = Number(td.getAttribute("data-base") || "0");
+          if (Number.isFinite(db) && db > 0) return true;
+          const txt = (td.textContent || "").replace(/[^\d]/g, "");
+          const n = Number(txt || "0");
+          return Number.isFinite(n) && n > 0;
+        });
+      }, opts),
+    timeoutMs,
     false
   );
-  if (!okSearch) throw new Error("No apareció el buscador (input#search)");
-
-  // Limpia y busca
-  await searchInput.fill("");
-  await searchInput.type(String(page.__query), { delay: 10 });
-
-  // al apretar Enter a veces navega, a veces solo refresca listado
-  await Promise.allSettled([
-    searchInput.press("Enter"),
-    page.waitForLoadState("domcontentloaded", { timeout: 15000 }),
-  ]);
-
-  await dismissOverlays(page);
-
-  // ✅ Selector unificado (esto corrige tu timeout en Railway)
-  const anyFirstCard = page
-    .locator(
-      "li.item.product.product-item, li.product-item, [data-container='product-grid'] li"
-    )
-    .first();
-
-  let found = await safeWait(
-    (opts) => anyFirstCard.waitFor({ state: "visible", ...opts }),
-    30000,
-    false
-  );
-
-  if (!found) {
-    if (await hasNoResults(page)) {
-      throw new Error("Sin resultados para el ID buscado");
-    }
-
-    // retry suave (a veces MP no refresca el grid en el primer enter)
-    await sleep(1200);
-    await Promise.allSettled([
-      searchInput.press("Enter"),
-      page.waitForLoadState("domcontentloaded", { timeout: 15000 }),
-    ]);
-
-    found = await safeWait(
-      (opts) => anyFirstCard.waitFor({ state: "visible", ...opts }),
-      35000,
-      false
-    );
-
-    if (!found) {
-      // último intento: recarga la URL base y reintenta una vez
-      await page.goto(SEARCH_URL, { waitUntil: "domcontentloaded" });
-      await dismissOverlays(page);
-
-      const okSearch2 = await safeWait(
-        (opts) => searchInput.waitFor({ state: "visible", ...opts }),
-        30000,
-        false
-      );
-      if (!okSearch2) throw new Error("No reapareció el buscador tras recarga");
-
-      await searchInput.fill("");
-      await searchInput.type(String(page.__query), { delay: 10 });
-
-      await Promise.allSettled([
-        searchInput.press("Enter"),
-        page.waitForLoadState("domcontentloaded", { timeout: 15000 }),
-      ]);
-
-      found = await safeWait(
-        (opts) => anyFirstCard.waitFor({ state: "visible", ...opts }),
-        35000,
-        false
-      );
-
-      if (!found) {
-        throw new Error("No pude ver resultados (timeout en lista de productos)");
-      }
-    }
-  }
-
-  // ya tenemos el primer card visible
-  const firstCard = anyFirstCard;
-
-  const verProducto = firstCard
-    .locator("a.action.tocart.primary.cc-link")
-    .first();
-  const fallbackText = firstCard.locator('a:has-text("Ver Producto")').first();
-  const fallbackTitle = firstCard
-    .locator("a.product-item-link, a[href*='/ferreteria2/']")
-    .first();
-
-  const clickTarget =
-    (await verProducto.count()) > 0
-      ? verProducto
-      : (await fallbackText.count()) > 0
-      ? fallbackText
-      : (await fallbackTitle.count()) > 0
-      ? fallbackTitle
-      : null;
-
-  if (!clickTarget) {
-    throw new Error("No encontré link para entrar al producto desde resultados");
-  }
-
-  await Promise.allSettled([
-    clickTarget.click(),
-    page.waitForLoadState("domcontentloaded", { timeout: 20000 }),
-  ]);
-
-  const okTitle = await safeWait(
-    (opts) => page.waitForSelector("h1.page-title", opts),
-    30000,
-    false
-  );
-  if (!okTitle) {
-    // a veces el click abre en misma página pero demora; un wait extra no hace daño
-    const okTitle2 = await safeWait(
-      (opts) => page.waitForSelector("h1.page-title", opts),
-      20000,
-      false
-    );
-    if (!okTitle2) {
-      throw new Error("No cargó la página del producto (sin h1.page-title)");
-    }
-  }
 }
 
 async function ensureProvidersSectionVisible(page) {
-  await dismissOverlays(page);
-
   const btn = page
     .locator(
       'button:has-text("VER PROVEEDORES"), button:has-text("Ver proveedores")'
@@ -348,9 +177,141 @@ async function ensureProvidersSectionVisible(page) {
 }
 
 /* =========================================================
-   ✅ scrapeProduct: ahora NO abre browser ni context
-   - Solo pide context singleton
-   - Crea una page, trabaja, y la cierra
+   ✅ navegación a producto (con retry)
+========================================================= */
+async function goToFirstProductFromSearch(page) {
+  const searchInput = page.locator("input#search, input[name='q']");
+  await searchInput.waitFor({ state: "visible", timeout: 30000 });
+
+  await searchInput.fill("");
+  await searchInput.type(String(page.__query), { delay: 10 });
+  await searchInput.press("Enter");
+
+  const firstCardA = page.locator("li.item.product.product-item").first();
+  const firstCardB = page.locator("li.product-item").first();
+  const firstCardC = page.locator("[data-container='product-grid'] li").first();
+
+  let found =
+    (await safeWait(() => firstCardA.waitFor({ state: "visible" }), 25000, false)) ||
+    (await safeWait(() => firstCardB.waitFor({ state: "visible" }), 25000, false)) ||
+    (await safeWait(() => firstCardC.waitFor({ state: "visible" }), 25000, false));
+
+  if (!found) {
+    if (await hasNoResults(page)) throw new Error("Sin resultados para el ID buscado");
+
+    // retry soft
+    await sleep(1200);
+    await searchInput.press("Enter");
+
+    found =
+      (await safeWait(() => firstCardA.waitFor({ state: "visible" }), 30000, false)) ||
+      (await safeWait(() => firstCardB.waitFor({ state: "visible" }), 30000, false)) ||
+      (await safeWait(() => firstCardC.waitFor({ state: "visible" }), 30000, false));
+
+    if (!found) throw new Error("No pude ver resultados (timeout en lista de productos)");
+  }
+
+  const firstCard =
+    (await firstCardA.count()) ? firstCardA :
+    (await firstCardB.count()) ? firstCardB :
+    firstCardC;
+
+  const verProducto = firstCard.locator("a.action.tocart.primary.cc-link").first();
+  const fallbackText = firstCard.locator('a:has-text("Ver Producto")').first();
+  const fallbackTitle = firstCard
+    .locator("a.product-item-link, a[href*='/ferreteria2/']")
+    .first();
+
+  if ((await verProducto.count()) > 0) {
+    await verProducto.click();
+  } else if ((await fallbackText.count()) > 0) {
+    await fallbackText.click();
+  } else if ((await fallbackTitle.count()) > 0) {
+    await fallbackTitle.click();
+  } else {
+    throw new Error("No encontré link para entrar al producto desde resultados");
+  }
+
+  // gate de producto
+  const okTitle = await safeWait(
+    (opts) => page.waitForSelector("h1.page-title", opts),
+    30000,
+    false
+  );
+  if (!okTitle) throw new Error("No cargó la página del producto (sin h1.page-title)");
+}
+
+/* =========================================================
+   ✅ buscar selector de región (con fallbacks)
+========================================================= */
+async function findRegionSelect(page) {
+  // tu selector original
+  const s1 = page.locator("select#attribute2276").first();
+  if (await safeWait((opts) => s1.waitFor({ state: "visible", ...opts }), 6000, false)) {
+    return s1;
+  }
+
+  // fallbacks comunes (por si MP cambia)
+  const s2 = page.locator("select[name*='region' i]").first();
+  if (await safeWait((opts) => s2.waitFor({ state: "visible", ...opts }), 6000, false)) {
+    return s2;
+  }
+
+  const s3 = page.locator("select[id*='region' i]").first();
+  if (await safeWait((opts) => s3.waitFor({ state: "visible", ...opts }), 6000, false)) {
+    return s3;
+  }
+
+  return null;
+}
+
+/* =========================================================
+   ✅ extracción de filas (precio por data-base o texto)
+========================================================= */
+async function extractMinOffer(page) {
+  await ensureProvidersSectionVisible(page);
+
+  const ok = await waitOffersLoaded(page, 25000);
+  if (!ok) return null;
+
+  const rows = await page.$$eval("tr.flag-row-seller", (trs) => {
+    function numFromText(s) {
+      const n = Number(String(s || "").replace(/[^\d]/g, ""));
+      return Number.isFinite(n) ? n : 0;
+    }
+
+    return trs
+      .map((tr) => {
+        const proveedor =
+          tr.querySelector("td.wk-ap-seller-name a.wk-ap-shop-link")
+            ?.textContent?.trim() ||
+          tr.querySelector("td.wk-ap-seller-name")?.textContent?.trim() ||
+          null;
+
+        const diasText =
+          tr.querySelector("td.wk-ap-delivery-days span.bdays")
+            ?.textContent?.trim() || null;
+
+        const tdPrice = tr.querySelector("td.wk-ap-price");
+        const base = Number(tdPrice?.getAttribute("data-base") || "0");
+        const textNum = numFromText(tdPrice?.textContent || "");
+        const precio = Number.isFinite(base) && base > 0 ? base : textNum;
+
+        return {
+          proveedor,
+          diasHabiles: diasText,
+          precio,
+        };
+      })
+      .filter((x) => x && x.proveedor && Number.isFinite(x.precio) && x.precio > 0);
+  });
+
+  if (!rows.length) return null;
+  return rows.reduce((a, b) => (a.precio < b.precio ? a : b));
+}
+
+/* =========================================================
+   ✅ scrapeProduct (resiliente)
 ========================================================= */
 async function scrapeProduct(query, regionesElegidas = ["RM"]) {
   await acquire();
@@ -359,14 +320,35 @@ async function scrapeProduct(query, regionesElegidas = ["RM"]) {
 
   try {
     const context = await getContext();
-
     page = await context.newPage();
     page.setDefaultTimeout(30000);
     page.__query = query;
 
-    await page.goto(SEARCH_URL, { waitUntil: "domcontentloaded" });
+    // navegación con retry
+    let navOk = await safeWait(
+      (opts) => page.goto(SEARCH_URL, { waitUntil: "domcontentloaded", ...opts }),
+      45000,
+      false
+    );
+    if (!navOk) {
+      await sleep(1200);
+      navOk = await safeWait(
+        (opts) => page.goto(SEARCH_URL, { waitUntil: "domcontentloaded", ...opts }),
+        45000,
+        false
+      );
+      if (!navOk) throw new Error("No pude abrir SEARCH_URL");
+    }
 
-    await goToFirstProductFromSearch(page);
+    // entrar a producto con retry
+    try {
+      await goToFirstProductFromSearch(page);
+    } catch (e1) {
+      // retry completo una vez
+      await sleep(1200);
+      await page.goto(SEARCH_URL, { waitUntil: "domcontentloaded" });
+      await goToFirstProductFromSearch(page);
+    }
 
     const title = await page.locator("h1.page-title").first().innerText();
 
@@ -376,76 +358,67 @@ async function scrapeProduct(query, regionesElegidas = ["RM"]) {
       regiones: {},
     };
 
-    const regionSelect = page.locator("select#attribute2276").first();
-    const okRegionSelect = await safeWait(
-      (opts) => regionSelect.waitFor({ state: "visible", ...opts }),
-      30000,
-      false
-    );
-    if (!okRegionSelect) {
-      throw new Error("No apareció el selector de regiones (#attribute2276)");
-    }
+    // encontrar selector región (fallbacks)
+    const regionSelect = await findRegionSelect(page);
 
-    for (const regionKey of regionesElegidas) {
-      const regionId = REGIONES[regionKey];
-      if (!regionId) continue;
+    // Caso 1: hay selector región => tu flujo normal
+    if (regionSelect) {
+      for (const regionKey of regionesElegidas) {
+        const regionId = REGIONES[regionKey];
+        if (!regionId) continue;
 
-      // Cambia región
-      await regionSelect.selectOption(regionId);
+        // selectOption con retry (a veces el DOM se re-renderiza)
+        let okSel = true;
+        try {
+          await regionSelect.selectOption(regionId);
+        } catch (_) {
+          okSel = false;
+        }
 
-      // A veces el cambio dispara requests; domcontentloaded no cambia, así que esperamos un pelín
-      await sleep(300);
+        if (!okSel) {
+          // re-buscar selector y reintentar
+          const rs2 = await findRegionSelect(page);
+          if (!rs2) {
+            result.regiones[regionKey] = null;
+            continue;
+          }
+          try {
+            await rs2.selectOption(regionId);
+          } catch (_) {
+            result.regiones[regionKey] = null;
+            continue;
+          }
+        }
 
-      await ensureProvidersSectionVisible(page);
-
-      const offersOk = await waitOffersLoaded(page, 30000);
-      if (!offersOk) {
-        result.regiones[regionKey] = null;
-        continue;
+        const minOffer = await extractMinOffer(page);
+        result.regiones[regionKey] = minOffer ? minOffer : null;
       }
 
-      const rows = await page.$$eval("tr.flag-row-seller", (trs) => {
-        return trs
-          .map((tr) => {
-            const proveedor =
-              tr.querySelector("td.wk-ap-seller-name a.wk-ap-shop-link")
-                ?.textContent?.trim() ||
-              tr.querySelector("td.wk-ap-seller-name")?.textContent?.trim() ||
-              null;
-
-            const diasText =
-              tr.querySelector("td.wk-ap-delivery-days span.bdays")
-                ?.textContent?.trim() || null;
-
-            const precioBaseAttr =
-              tr.querySelector("td.wk-ap-price")?.getAttribute("data-base") ||
-              "0";
-
-            const precio = Number(precioBaseAttr);
-
-            return {
-              proveedor,
-              diasHabiles: diasText,
-              precio,
-            };
-          })
-          .filter(
-            (x) => x && x.proveedor && Number.isFinite(x.precio) && x.precio > 0
-          );
-      });
-
-      if (rows.length > 0) {
-        const min = rows.reduce((a, b) => (a.precio < b.precio ? a : b));
-        result.regiones[regionKey] = min;
-      } else {
-        result.regiones[regionKey] = null;
-      }
+      return result;
     }
 
+    // Caso 2: NO hay selector región
+    // => no reventamos. Scrapeamos ofertas del estado actual
+    // y asignamos al menos a la primera región pedida (o RM).
+    const fallbackRegion = regionesElegidas?.[0] || "RM";
+    const minOffer = await extractMinOffer(page);
+
+    if (minOffer) {
+      result.regiones[fallbackRegion] = minOffer;
+      // las otras regiones quedan null (honesto)
+      for (const rk of regionesElegidas) {
+        if (rk !== fallbackRegion) result.regiones[rk] = null;
+      }
+      return result;
+    }
+
+    // si ni siquiera hay tabla, devolvemos todo null (pero sin romper el proceso)
+    for (const rk of regionesElegidas) result.regiones[rk] = null;
     return result;
   } catch (e) {
-    // Si Playwright queda en estado malo, reseteamos el browser
     const msg = String(e?.message || e);
+
+    // reset si es error “crítico” de Playwright
     if (
       msg.includes("Target closed") ||
       msg.includes("has been closed") ||
@@ -455,6 +428,7 @@ async function scrapeProduct(query, regionesElegidas = ["RM"]) {
       console.warn("[scraper] Error crítico, reseteando browser:", msg);
       await resetBrowser();
     }
+
     throw e;
   } finally {
     try {
@@ -466,7 +440,7 @@ async function scrapeProduct(query, regionesElegidas = ["RM"]) {
 }
 
 /* =========================================================
-   ✅ Opcional: cierre limpio del browser (server.js)
+   ✅ cierre limpio
 ========================================================= */
 async function shutdownScraper() {
   await resetBrowser();
